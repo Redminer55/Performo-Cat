@@ -14,6 +14,20 @@ from tkinter import filedialog, messagebox
 from PIL import Image, ImageChops, ImageColor, ImageDraw, ImageFont, ImageOps, ImageTk
 import win32com.client
 
+#Multiplayer libs
+import paho.mqtt.client as mqtt
+from prompt_toolkit import PromptSession
+from prompt_toolkit.patch_stdout import patch_stdout
+import uuid
+import socket
+import psutil
+import platform
+import re
+import threading
+
+MULTIPLAYER_USERS = {}
+MULTIPLAYER_CATS = {}  # name -> Multiplayer_Cat-Instanz
+
 if getattr(sys, "frozen", False):
     # Als PyInstaller-EXE gestartet
     FOLDER = str(Path(sys.executable).parent)
@@ -107,7 +121,7 @@ class BitmapInfo(ctypes.Structure):
     _fields_ = [("bmiHeader", BitmapInfoHeader), ("bmiColors", RGBQuad * 1)]
 
 
-class BongoCatPro:
+class PerformoCat:
     """Small, always-on-top Bongo Cat overlay with system-wide key tracking."""
 
     HEART_TOP_PADDING = 96
@@ -179,6 +193,8 @@ class BongoCatPro:
         self.chest_reward_name = ""
         self.chest_reward_preview = None
         self.pressed_keys = set()
+        self.last_keydown_time = 0.0
+        self.BOTH_KEY_WINDOW = 0.10  # 100 Millisekunden
         self.pending_cat_transforms = []
         self.tap_visual_keys = set()
         self.tap_visual_until = 0.0
@@ -197,6 +213,15 @@ class BongoCatPro:
         self.is_ghost = False
         self.hook = None
         self.hook_callback = None
+
+        self.multiplayer_room = None
+        self.multiplayer_err = None
+        self.client = None
+        #self.multiplayer_name = None
+        self.multiplayer_sender_thread = None
+        self.multiplayer_connect_disconnect_btn = None
+        self.enterd_session_code = "Bongo_Session"
+        self.last_alive = time.time()
 
         self.load_and_resize_images()
         self.canvas = tk.Canvas(root, width=self.width, height=self.height,
@@ -220,7 +245,7 @@ class BongoCatPro:
                 f.write("True")
 
             messagebox.showinfo("Bongo Cat", "Alles wurde erfolgreich Freigeschaltet, bitte starte das Spiel erneut um die Änderungen anzuwenden.\n(Das Programm beendet sich Automatisch wenn du auf Okay drückst)")
-            sys.exit(1)
+            PerformoCatApp.close()
         else:
             self.cheats_var = False
 
@@ -470,6 +495,12 @@ class BongoCatPro:
 
                 if self.current_skin == "Soldat":
                     hat_x -= round(sprite.width * 0.15)
+
+                if self.cat_flipped:
+                    if self.current_skin == "Soldat":
+                        hat_x += round(sprite.width * 0.35)
+                    else:
+                        hat_x += round(sprite.width * 0.10)
                 
                 frame.alpha_composite(self.display_hat_image, (hat_x, hat_y))
 
@@ -742,8 +773,18 @@ class BongoCatPro:
                         self.total_presses += 1
                         self.pressed_keys.add(vk)
                         self.counter_needs_save = True
-                        self.tap_paw = ("both" if len(self.pressed_keys) >= 2
-                                        else self.next_tap_paw)
+
+                        now = time.monotonic()
+
+                        two_keys_quickly = (
+                            bool(self.pressed_keys)
+                            and now - self.last_keydown_time <= self.BOTH_KEY_WINDOW
+                        )
+
+                        self.tap_paw = "both" if two_keys_quickly else self.next_tap_paw
+
+                        self.last_keydown_time = now
+                        
                         self.next_tap_paw = "right" if self.next_tap_paw == "left" else "left"
                         self.tap_visual_keys = {vk}
                         self.tap_visual_until = time.monotonic() + 0.14
@@ -1307,6 +1348,72 @@ class BongoCatPro:
                              activeforeground="#67432e", relief="flat", bd=0,
                              font=("Segoe UI", 9), padx=8, pady=5, **options)
 
+        def entry(parent, title, attr_name, default="", placeholder="", width=28, pad_y=0):
+            """
+            Entry mit Titel. Inhalt liegt in getattr(self, attr_name).
+            Bei jeder Änderung wird self.<attr_name> aktualisiert.
+            """
+            row = tk.Frame(parent, bg="#fff4dd")
+            row.pack(fill="x", padx=8, pady=(2, 4))
+
+            tk.Label(
+                row,
+                text=title,
+                bg="#fff4dd",
+                fg="#67432e",
+                font=("Segoe UI", 8),
+            ).pack(side="left", padx=(0, 6))
+
+            # Startwert aus self, sonst default
+            current = getattr(self, attr_name, None)
+            if current is None or current == "":
+                current = default
+                setattr(self, attr_name, current)
+
+            var = tk.StringVar(value=current)
+
+            def on_change(*_args):
+                setattr(self, attr_name, var.get())
+                if attr_name == "multiplayer_name":
+                    self.root.after(0, lambda: self.save_counter())
+
+            var.trace_add("write", on_change)
+
+            entry = tk.Entry(
+                row,
+                textvariable=var,
+                font=("Segoe UI", 9),
+                bg="#fffaf0",
+                fg="#67432e",
+                insertbackground="#67432e",
+                relief="solid",
+                bd=1,
+                highlightthickness=1,
+                highlightbackground="#d8bd93",
+                highlightcolor="#e8973e",
+                width=width,
+            )
+            entry.pack(side="left", fill="x", expand=True, pady=pad_y)
+
+            if placeholder and not current:
+                entry.insert(0, placeholder)
+                entry.configure(fg="#8b8175")
+
+                def on_focus_in(_event):
+                    if entry.get() == placeholder:
+                        entry.delete(0, "end")
+                        entry.configure(fg="#67432e")
+
+                def on_focus_out(_event):
+                    if not entry.get().strip():
+                        entry.insert(0, placeholder)
+                        entry.configure(fg="#8b8175")
+
+                entry.bind("<FocusIn>", on_focus_in)
+                entry.bind("<FocusOut>", on_focus_out)
+
+            return entry
+
         def add_chest_row(parent, tab_name):
             row = tk.Frame(parent, bg="#fff4dd")
             row.pack(fill="x", padx=8, pady=(0, 3))
@@ -1591,14 +1698,37 @@ class BongoCatPro:
                     more.grid(row=(len(visible_items) + 2) // 3, column=0,
                               columnspan=3, sticky="ew", padx=3, pady=6)
             elif tab_name == "Multiplayer":
+                self.multiplayer_err = None
+
                 tk.Label(content, text="Multiplayer", bg="#fff4dd", fg="#67432e",
                          font=("Segoe UI Semibold", 10)).pack(anchor="w", padx=8, pady=(7, 6))
-                tk.Label(content, text="●  Nicht verbunden", bg="#fff4dd", fg="#67432e",
-                         font=("Segoe UI", 9)).pack(anchor="w", padx=8)
-                tk.Label(content, text="Der lokale Bongo Cat hat derzeit keine Online-Verbindung.",
-                         bg="#fff4dd", fg="#67432e", font=("Segoe UI", 9),
-                         wraplength=320, justify="left").pack(anchor="w", padx=8, pady=6)
 
+                self.multiplayer_label = tk.Label(content, text="●  Du bist mit keinem Server verbunden", bg="#fff4dd", fg="#67432e",
+                    font=("Segoe UI", 9))
+                self.multiplayer_label.pack(anchor="w", padx=8)
+
+                self.name_entry = entry(content, "Benutzername:", "multiplayer_name",self.multiplayer_name, pad_y=(7,0))
+                self.session_entry = entry(content, "Session-Code:", "enterd_session_code", self.enterd_session_code)
+
+                self.refresh_multiplayer_label()
+                self.root.after(100, self.refresh_multiplayer_label)
+
+                btn_text = "Session beitreten"
+                info_label_text = "Trete einer Session bei oder erzeuge eine Neue"
+                if self.multiplayer_room != None:
+                    btn_text = "Session verlassen"
+                    info_label_text = "Spieler Information wird geladen ..."
+                
+                self.multiplayer_connect_disconnect_btn = button(content, btn_text, self.multiplayer_con_discon_pressed, anchor="w")
+                
+                self.multiplayer_connect_disconnect_btn.pack(fill="x", padx=7, pady=(15, 0))
+
+                self.multiplayer_info_label = tk.Label(content, text=info_label_text,
+                                                         bg="#fff4dd", fg="#67432e", font=("Segoe UI", 9),
+                                                         wraplength=320, justify="left")
+                self.multiplayer_info_label.pack(anchor="w", padx=8, pady=6)
+                                
+                
             elif tab_name == "+":
                 tk.Label(content, text="Importieren", bg="#fff4dd", fg="#67432e",
                     font=("Segoe UI Semibold", 10)).pack(anchor="w", padx=8, pady=(7, 6))
@@ -1736,7 +1866,7 @@ class BongoCatPro:
                                 select_label.configure(text="1 Hut erfolgreich hinzugefügt")
                         
                             if unlocked_hats != 1:
-                                label_text = f"{unlocked_skins} Hüte davon wurden bereits für dich freigeschaltet"
+                                label_text = f"{unlocked_hats} Hüte davon wurden bereits für dich freigeschaltet"
                             else:
                                 label_text = "1 Hut davon wurde bereits für dich freigeschaltet"
                         
@@ -1819,6 +1949,11 @@ class BongoCatPro:
                     padx=7,
                     pady=(3, 0)
                 )
+
+                if UNLOCK_ALL_ITEMS == True:
+                    self.cheats_checkbtn.configure(state="disabled")
+                else:
+                    self.cheats_checkbtn.configure(state="active")
                 
                 button(content, "Z\u00e4hler zur\u00fccksetzen",
                        lambda: (self.reset_counter(), show_tab("Settings")), anchor="w").pack(fill="x", padx=7, pady=(7, 0))
@@ -1943,6 +2078,11 @@ class BongoCatPro:
                         name for name in saved_unlocked_skins
                         if isinstance(name, str) and name in available_skins
                     }
+                self.multiplayer_name = data.get("multiplayer_name")
+
+                if self.multiplayer_name == None:
+                    self.multiplayer_name = f"user_{random.randint(1000,9999)}"
+
                 self.unlocked_skins.add("Default")
                 if isinstance(saved_skin, str):
                     saved_skin_folder = os.path.join(FOLDER, "Bongo_sprites", saved_skin)
@@ -1996,6 +2136,7 @@ class BongoCatPro:
                            "unlocked_hats": sorted(self.unlocked_hats),
                            "pending_chests": self.pending_chests,
                            "chest_progress": self.chest_progress,
+                           "multiplayer_name": self.multiplayer_name,
                            "x": self.window_x, "y": self.window_y}, counter_file)
         except OSError as error:
             print(f"Tap-Zähler konnte nicht gespeichert werden: {error}")
@@ -2008,8 +2149,1293 @@ class BongoCatPro:
         if getattr(self, "mouse_hook", None):
             self.user32.UnhookWindowsHookEx(self.mouse_hook)
             self.mouse_hook = None
+
         self.root.destroy()
 
+        if self.multiplayer_room != None:
+            self.multiplayer_send("[LEAVE]")
+            self.disconnect_multiplayer()
+        
+        exit(1)
+
+    def refresh_multiplayer_label(self):
+        label = getattr(self, "multiplayer_label", None)
+
+        if label is None:
+            return
+
+        try:
+            if not label.winfo_exists():
+                self.multiplayer_label = None
+                return
+
+            if self.client is not None and self.client.is_connected():
+                text = f"●  Verbunden: {self.multiplayer_room}"
+
+                color = "#228B22"
+
+            elif self.multiplayer_err != None:
+                text = f"●  Fehler: {self.multiplayer_err}"
+                color = "#b26a00"
+
+            else:
+                text = "●  Du bist mit keinem Server verbunden"
+                color = "#b26a00"
+
+            if label.cget("text") != text:
+                label.configure(text=text, fg=color)
+
+            self.root.after(1000, self.refresh_multiplayer_label)
+
+        except tk.TclError:
+            self.multiplayer_label = None
+
+    def multiplayer_con_discon_pressed(self):
+        self.multiplayer_connect_disconnect_btn.configure(state="disabled")
+        if self.multiplayer_room == None:
+            self.root.after(0, self.innit_multiplayer)
+        else:
+            self.multiplayer_send("[LEAVE]")
+            self.root.after(1000, self.disconnect_multiplayer)
+
+    def multiplayer_send(self,text):
+        msg_id = str(uuid.uuid4())
+
+        chunks = [text[i:i+self.CHUNK_SIZE] for i in range(0, len(text), self.CHUNK_SIZE)]
+
+        total = len(chunks)
+
+        for i, chunk in enumerate(chunks):
+            payload = f"{self.multiplayer_name}|{msg_id}|{i}|{total}|{chunk}"
+            self.client.publish(self.multiplayer_room, payload)
+
+    def multiplayer_recieve(self,client, userdata, msg):
+        raw = msg.payload.decode()
+        
+        try:
+            sender, msg_id, idx, total, chunk = raw.split("|", 4)
+        
+            idx = int(idx)
+            total = int(total)
+        
+            if sender == self.multiplayer_name:
+                return
+        
+            if msg_id not in self.buffer:
+                self.buffer[msg_id] = {
+                    "sender": sender,
+                    "total": total,
+                    "chunks": {}
+            }
+        
+            self.buffer[msg_id]["chunks"][idx] = chunk
+        
+            # wenn komplett
+            if len(self.buffer[msg_id]["chunks"]) == total:
+                full_text = "".join(
+                    self.buffer[msg_id]["chunks"][i]
+                    for i in range(total)
+                )
+
+                full_text = full_text.strip()
+        
+                print(f"[{sender}] {full_text}")
+
+                if full_text == "[JOIN]":
+                    if not sender in MULTIPLAYER_USERS:
+                        MULTIPLAYER_USERS[sender] = {
+                            "skin": "Default",
+                            "paw_state": "idle",
+                            "bar_color": "#d8e0e9",
+                            "last_seen": time.time(),
+                            "cheats":False,
+                            "hat":None
+                        }
+                        self.root.after(0, lambda s=sender: self.spawn_multiplayer_cat(s))
+                        
+                elif full_text == "[PING]":
+                    self.multiplayer_send("[JOIN]")
+                    self.root.after(500, lambda: self.multiplayer_send(f"skin:{self.current_skin}"))
+                    self.root.after(500, lambda: self.multiplayer_send(f"hat:{self.current_hat}"))
+                    self.root.after(500, lambda: self.multiplayer_send(f"bar_color:{self.bar_accent_color}"))
+                    self.root.after(500, lambda: self.multiplayer_send(f"cheats:{UNLOCK_ALL_ITEMS}"))
+
+                elif not sender in MULTIPLAYER_USERS:
+                    print(f"Unknown User:",sender)
+                    pass
+
+                elif full_text == "[ALIVE]":
+                    MULTIPLAYER_USERS[sender]["last_seen"] = time.time()
+
+                elif full_text == "[LEAVE]":
+                    MULTIPLAYER_USERS.pop(sender, None)
+                    self.root.after(0, lambda s=sender: self.remove_multiplayer_cat(s))
+
+                else:
+                    MULTIPLAYER_USERS[sender]["last_seen"] = time.time()
+                    try:
+                        command, arg = full_text.split(":", 1)
+                        command = command.strip()
+                        arg = arg.strip()
+                        if command in ("paw_state", "skin", "hat", "bar_color", "cheats"):
+                            if command == "cheats":
+                                MULTIPLAYER_USERS[sender][command] = (
+                                    arg.lower() in ("true", "1", "yes")
+                                )
+                            elif command == "hat":
+                                MULTIPLAYER_USERS[sender][command] = (
+                                    None if arg in ("None", "null", "") else arg
+                                )
+                            else:
+                                MULTIPLAYER_USERS[sender][command] = arg
+                    except ValueError:
+                        pass
+
+                del self.buffer[msg_id]
+        
+        except Exception as e:
+            print(f"Multiplayer Error: {e}")
+
+    def multiplayer_loop(self):
+        cheats_bef = UNLOCK_ALL_ITEMS
+        skin_bef = self.current_skin
+        bar_color_bef = self.bar_accent_color
+        hat_bef = self.current_hat
+        paw_state_bef = self.get_paw_state()
+        current_paw_state = paw_state_bef
+        self.last_alive = time.time()
+        self_kill = False
+        while self.multiplayer_room != None:
+            current_paw_state = self.get_paw_state()
+
+            if cheats_bef != UNLOCK_ALL_ITEMS:
+                cheats_bef = UNLOCK_ALL_ITEMS
+                self.last_alive = time.time()
+                self.multiplayer_send(f"cheats:{UNLOCK_ALL_ITEMS}")
+
+            if skin_bef != self.current_skin:
+                skin_bef = self.current_skin
+                self.last_alive = time.time()
+                self.multiplayer_send(f"skin:{self.current_skin}")
+
+            if bar_color_bef != self.bar_accent_color:
+                bar_color_bef = self.bar_accent_color
+                self.last_alive = time.time()
+                self.multiplayer_send(f"bar_color:{self.bar_accent_color}")
+
+            if paw_state_bef != current_paw_state:
+                paw_state_bef = current_paw_state
+                self.last_alive = time.time()
+                self.multiplayer_send(f"paw_state:{current_paw_state}")
+
+            if hat_bef != self.current_hat:
+                hat_bef = self.current_hat
+                self.last_alive = time.time()
+                self.multiplayer_send(f"hat:{self.current_hat}")
+
+            try:
+                if len(MULTIPLAYER_USERS) == 1:
+                    self.multiplayer_info_label.configure(text=f"{len(MULTIPLAYER_USERS)} anderer Spieler in dieser Session")
+                else:
+                    self.multiplayer_info_label.configure(text=f"{len(MULTIPLAYER_USERS)} andere Spieler in dieser Session")
+            except:
+                pass
+
+            for user in list(MULTIPLAYER_USERS):
+                if time.time() - MULTIPLAYER_USERS[user]["last_seen"] > 35:
+                    self.root.after(0, lambda s=user: self.remove_multiplayer_cat(s))
+                    MULTIPLAYER_USERS.pop(user, None)
+                    print(f'Multiplayer Error: user "{user}" connection timeout')
+
+            if time.time() - self.last_alive > 30:
+                if not self_kill:
+                    room = self.multiplayer_room
+                    self.multiplayer_send("[LEAVE]")
+                    self.root.after(1000, self.disconnect_multiplayer)
+                    messagebox.showerror("Bongo Cat", f'Es ist ein Fehler aufgetreten und du wurdest von der Session "{room}" getrennt\n\nGrund: self.multiplayer_loop() iteration timeout')
+
+            if time.time() - self.last_alive > 20:
+                if not self_kill:
+                    self.multiplayer_send("[ALIVE]")
+                    self.last_alive = time.time()
+
+            self.sync_multiplayer_cats()
+
+            time.sleep(0.05)
+
+    def disconnect_multiplayer(self):
+        self.multiplayer_room = None  # beendet multiplayer_loop
+
+        thread = getattr(self, "multiplayer_sender_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.5)
+        self.multiplayer_sender_thread = None
+
+        for name in list(MULTIPLAYER_CATS):
+            self.remove_multiplayer_cat(name)
+
+        client = getattr(self, "client", None)
+        if client is not None:
+            def _stop():
+                try:
+                    if client.is_connected():
+                        client.disconnect()
+                except Exception as e:
+                    self.multiplayer_err = e
+                try:
+                    client.loop_stop()
+                except Exception:
+                    pass
+
+            threading.Thread(target=_stop, daemon=True).start()
+            self.client = None
+
+        def reset_btn():
+            try:
+                btn = getattr(self, "multiplayer_connect_disconnect_btn", None)
+                if btn is not None and btn.winfo_exists():
+                    btn.configure(text="Session beitreten", state="active")
+                self.multiplayer_info_label.configure(text="Trete einer Session bei oder erzeuge eine Neue")
+            except tk.TclError:
+                pass
+
+        self.root.after(0, reset_btn)
+
+    def innit_multiplayer(self):
+        room = ""
+        name = ""
+    
+        try:
+            name = self.multiplayer_name.strip()
+            room = self.enterd_session_code.strip()
+        except: 
+            return
+
+        if room == "":
+            messagebox.showinfo("Bongo Cat","Bitte gebe einen Benutzernamen und einen Session Code ein um einer Session beizutreten/eine zu erstellen")
+            return
+
+        if name == "":
+            messagebox.showinfo("Bongo Cat","Bitte gebe einen Benutzernamen und einen Session Code ein um einer Session beizutreten/eine zu erstellen")
+            return
+
+        if self.multiplayer_name == None:
+            self.multiplayer_name = f"user_{random.randint(1000,9999)}"
+        
+        internet = check_internet()
+
+        def label_rst():
+            self.multiplayer_connect_disconnect_btn.configure(text="Session beitreten", state="active")
+
+
+        if not internet:
+            self.multiplayer_err = "Verbindung fehlgeschlagen: Keine Internetverbindung erkannt!"
+            label_rst()
+            return
+        
+        self.buffer = {}
+        self.CHUNK_SIZE = 400
+
+        self.client=mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id=self.multiplayer_name
+        )
+
+        try:
+            self.client.connect("broker.hivemq.com",1883,60)
+            self.client.subscribe(room)
+            self.client.loop_start()
+        except:
+            self.multiplayer_err = "Verbindug mit dem Server fehlgeschlagen"
+            label_rst()
+            return
+
+        self.multiplayer_room = room
+
+        try:
+            self.multiplayer_connect_disconnect_btn.configure(text="Session verlassen", state="active")
+            self.multiplayer_info_label.configure(text="Spieler Information wird geladen ...")
+        except:
+            pass
+
+        self.client.on_message=self.multiplayer_recieve
+
+        self.multiplayer_sender_thread = threading.Thread(target=self.multiplayer_loop)
+        self.multiplayer_sender_thread.start()
+
+        self.root.after(1000, lambda: self.multiplayer_send("[JOIN]"))
+
+        self.root.after(1500, lambda: self.multiplayer_send(f"skin:{self.current_skin}"))
+        self.root.after(1500, lambda: self.multiplayer_send(f"hat:{self.current_hat}"))
+        self.root.after(1500, lambda: self.multiplayer_send(f"bar_color:{self.bar_accent_color}"))
+        self.root.after(1500, lambda: self.multiplayer_send(f"cheats:{UNLOCK_ALL_ITEMS}"))
+
+        self.root.after(2000, lambda: self.multiplayer_send("[PING]"))
+
+    def spawn_multiplayer_cat(self, name):
+        """Erzeugt ein Multiplayer_Cat-Fenster für einen anderen Spieler."""
+        if name in MULTIPLAYER_CATS or name == self.multiplayer_name:
+            return
+        if name not in MULTIPLAYER_USERS:
+            return
+        try:
+            win = tk.Toplevel(self.root)
+            cat = Multiplayer_Cat(win, name)
+            MULTIPLAYER_CATS[name] = cat
+        except Exception as e:
+            print(f"Multiplayer Cat spawn failed for {name}: {e}")
+
+    def remove_multiplayer_cat(self, name):
+        cat = MULTIPLAYER_CATS.pop(name, None)
+        if cat is not None:
+            try:
+                cat.close()
+            except Exception:
+                pass
+
+    def sync_multiplayer_cats(self):
+        for name in list(MULTIPLAYER_USERS):
+            if (name != self.multiplayer_name
+                    and name not in MULTIPLAYER_CATS):
+                self.spawn_multiplayer_cat(name)
+        for name in list(MULTIPLAYER_CATS):
+            if name not in MULTIPLAYER_USERS:
+                self.remove_multiplayer_cat(name)
+
+def check_internet(timeout=3):
+    """
+    Prüft, ob externe Ziele über TCP erreichbar sind.
+
+    Rückgabe:
+        True  -> mindestens ein Ziel erreichbar
+        False -> kein Testziel erreichbar
+    """
+
+    targets = [
+        ("1.1.1.1", 443),
+        ("8.8.8.8", 53),
+        ("9.9.9.9", 443),
+    ]
+
+    for host, port in targets:
+        try:
+            with socket.create_connection(
+                (host, port),
+                timeout=timeout,
+            ):
+                return True
+
+        except (OSError, TimeoutError):
+            continue
+
+    return False
+
+class Multiplayer_Cat:
+    """Schlankes Bongo-Cat-Overlay: Skin/Paw/Text per Variable, Drag/Flip/Rotate."""
+
+    HEART_TOP_PADDING = 96
+    HEART_RISE_DISTANCE = 55
+
+    def __init__(self, root, user):
+        self.root = root
+        self.running = True
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        self.transparent_color = "#302929"
+        self.root.config(bg=self.transparent_color)
+        self.root.wm_attributes("-transparentcolor", self.transparent_color)
+
+        self.name = user
+
+        self.name = user
+        self.bar_text = self.name  # <-- fehlt aktuell komplett
+
+        user_data = MULTIPLAYER_USERS.get(self.name, {})
+        skin_name = (user_data.get("skin") or "Default").strip() or "Default"
+        self.skin_path = os.path.join(FOLDER, "Bongo_sprites", skin_name)
+        if not os.path.isdir(self.skin_path):
+            messagebox.showinfo("Bongo Cat - Multiplayer", f"Der Spieler {user} nutzt einen unbekannten skin.\n\nDer Default skin wird für diesen Nutzer verwendet bis dieser einen bekannten Skin verwendet.")
+            self.skin_path = os.path.join(FOLDER, "Bongo_sprites", "Default")
+
+        self.paw_state = user_data.get("paw_state", "idle")
+        if self.paw_state not in ("idle", "left", "right", "both"):
+            self.paw_state = "idle"
+
+        hat = user_data.get("hat")
+        if hat in (None, "None", "null", ""):
+            self.hat_path = None
+        else:
+            self.hat_path = os.path.join(FOLDER, "Bongo_hats", f"{hat}.png")
+
+        self.bar_accent_color = user_data.get("bar_color", "#d8e0e9")
+        self.scale_factor = getattr(PerformoCatApp, "scale_factor", 0.45)
+
+        # nur einmal, und bool-sicher
+        cheats = user_data.get("cheats", False)
+        if isinstance(cheats, str):
+            cheats = cheats.lower() in ("true", "1", "yes")
+        self.emoji = "👿" if cheats else "\U0001F496"
+
+        self.window_x = random.randint(100, 500)
+        self.window_y = random.randint(100, 200)
+
+        self.cat_flipped = False
+        self.cat_rotation = 0
+        self.sprite_transform_cache = {}
+        self.hat_image = None
+        self.display_hat_image = None
+        self.is_ghost = False
+        self.floating_hearts = []
+        self.heart_base_image = self.make_heart_image()
+        self.love_animation_until = 0.0
+        self.pending_cat_transforms = []
+        self._prev_f_down = False
+        self._prev_r_down = False
+
+        self._counter_font = ImageFont.truetype(r"C:\Windows\Fonts\segoeuib.ttf", 12)
+        self._bar_text_cache = None
+        self._bar_text_width = 0
+
+        self.last_overlay_sprite = None
+        self.last_overlay_position = None
+        self.last_overlay_size = None
+        self.last_overlay_ghost = None
+        self.last_overlay_had_hearts = False
+        self.last_overlay_bar_text = None
+        self.overlay_horizontal_padding = 0
+        self.overlay_render_width = 0
+        self.overlay_error_shown = False
+        self.refresh_job = None
+        self.user32 = None
+        if os.name == "nt":
+            self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+        self.load_and_resize_images()
+        self.canvas = tk.Canvas(
+            root,
+            width=self.width,
+            height=self.height,
+            bg=self.transparent_color,
+            highlightthickness=0,
+        )
+        self.canvas.pack()
+        self.create_sprite_overlay()
+        self.canvas.bind("<Button-1>", self.start_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.finish_drag)
+        self.canvas.bind("<B1-Motion>", self.do_drag)
+        self.canvas.bind("<Button-3>", self.toggle_ghost_mode)
+
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+        # Letzte angewandte Global-Werte (für den 50-ms-Poll, raw wie im Modul)
+        self._polled_skin = self.skin_path
+        self._polled_paw = self.paw_state
+        self._polled_bar = self.bar_text
+        self._polled_hat = self.hat_path
+        self._polled_scale = self.scale_factor
+        self._polled_bar_color = self.bar_accent_color   # optional, falls du die Farbe auch pollst
+
+        self.update_display()
+        self.root.after(50, self.poll_config_loop)
+
+    # ------------------------------------------------------------------
+    # Öffentliche Steuerung (kann zur Laufzeit geändert werden)
+    # ------------------------------------------------------------------
+    def set_skin(self, path):
+        """Skin-Ordner setzen (Pfad zu idle/left/right/both.png)."""
+        path = (path or "").strip() or os.path.join(FOLDER, "Bongo_sprites", "Default")
+        if path == self.skin_path:
+            return
+        self.skin_path = path
+        self.sprite_transform_cache.clear()
+        self.load_and_resize_images()
+        self.canvas.config(width=self.width, height=self.height)
+        self.update_display()
+
+    def set_paw_state(self, state):
+        """Pfoten-Zustand: idle | left | right | both."""
+        if state in ("idle", "left", "right", "both") and state != self.paw_state:
+            self.paw_state = state
+            self.update_display()
+
+    def set_bar_text(self, text):
+        """Text in der unteren Leiste setzen."""
+        text = text if text is not None else ""
+        if text != self.bar_text:
+            self.bar_text = text
+            # Leistenhöhe neu berechnen, falls Text ein-/ausgeblendet wird
+            self.load_and_resize_images()
+            self.canvas.config(width=self.width, height=self.height)
+            self.update_display()
+
+    def set_hat(self, path):
+        """Hut-PNG setzen oder None zum Entfernen."""
+        if path != self.hat_path:
+            self.hat_path = path
+            self.load_hat_image()
+            self.update_display()
+
+    def set_scale(self, factor):
+        """Skalierung setzen (z.B. 0.3 / 0.45 / 0.55)."""
+        try:
+            factor = float(factor)
+        except (TypeError, ValueError):
+            return
+        if abs(factor - self.scale_factor) < 1e-6:
+            return
+        self.scale_factor = factor
+        self.sprite_transform_cache.clear()
+        self.load_and_resize_images()
+        self.canvas.config(width=self.width, height=self.height)
+        self.update_display()
+
+    def poll_config_loop(self):
+        if self.name not in MULTIPLAYER_USERS or not self.running:
+            self.close()
+            return
+
+        try:
+            data = MULTIPLAYER_USERS[self.name]
+            skin_name = (data.get("skin") or "Default").strip() or "Default"
+            skin = os.path.join(FOLDER, "Bongo_sprites", skin_name)
+            if not os.path.isdir(skin):
+                skin = os.path.join(FOLDER, "Bongo_sprites", "Default")
+
+            paw = data.get("paw_state", "idle")
+            if paw not in ("idle", "left", "right", "both"):
+                paw = "idle"
+
+            self.bar_accent_color = data.get("bar_color", "#d8e0e9")
+
+            hat_name = data.get("hat")
+            if hat_name in (None, "None", "null", ""):
+                hat = None
+            else:
+                hat = os.path.join(FOLDER, "Bongo_hats", f"{hat_name}.png")
+
+            scale = getattr(PerformoCatApp, "scale_factor", 0.45)
+
+            # Emoji bei Cheats-Änderung aktualisieren
+            cheats = data.get("cheats", False)
+            new_emoji = "👿" if cheats else "\U0001F496"
+            if new_emoji != self.emoji:
+                self.emoji = new_emoji
+                self.heart_base_image = self.make_heart_image()
+
+            if skin != self._polled_skin:
+                self._polled_skin = skin
+                self.set_skin(skin)
+
+            if paw != self._polled_paw:
+                self._polled_paw = paw
+                self.set_paw_state(paw)
+
+            if hat != self._polled_hat:
+                self._polled_hat = hat
+                self.set_hat(hat)
+
+            if scale != self._polled_scale:
+                self._polled_scale = scale
+                self.set_scale(scale)
+
+            new_bar_color = data.get("bar_color", "#d8e0e9")
+            if new_bar_color != getattr(self, "_polled_bar_color", None):
+                self._polled_bar_color = new_bar_color
+                self.bar_accent_color = new_bar_color
+                # kein komplettes Reload nötig, nur nächstes Render nimmt die Farbe
+
+        except Exception as error:
+            print(f"Config-Poll Fehler: {error}")
+
+        if self.running:
+            self.root.after(50, self.poll_config_loop)
+
+    # ------------------------------------------------------------------
+    # Laden
+    # ------------------------------------------------------------------
+    def load_and_resize_images(self):
+        try:
+            self.load_bar_accent_color()
+            names = ("idle.png", "left.png", "right.png", "both.png")
+            images = [Image.open(os.path.join(self.skin_path, name)) for name in names]
+            source_w, source_h = images[0].size
+            new_w = max(1, int(source_w * self.scale_factor))
+            new_h = max(1, int(source_h * self.scale_factor))
+            self.sprite_width, self.sprite_height = new_w, new_h
+            # Leiste nur, wenn Text vorhanden
+            bar_extra = 32 if self.bar_text else 0
+            self.width, self.height = new_w, new_h + bar_extra
+            self.root.geometry(f"{self.width}x{self.height}+{self.window_x}+{self.window_y}")
+            self.sprite_frames = [
+                img.convert("RGBA").resize((new_w, new_h), Image.Resampling.LANCZOS)
+                for img in images
+            ]
+            self.load_hat_image()
+            self.has_images = True
+        except Exception as error:
+            print(f"Fehler beim Laden der Bilder: {error}")
+            self.width = self.height = 200
+            self.sprite_width = self.sprite_height = 0
+            self.root.geometry(f"200x200+{self.window_x}+{self.window_y}")
+            self.sprite_frames = []
+            self.has_images = False
+
+    def load_bar_accent_color(self):
+        try:
+            self.bar_accent_color = MULTIPLAYER_USERS[self.name]["bar_color"]
+        except:
+            pass
+
+    def load_hat_image(self):
+        self.hat_image = None
+        self.display_hat_image = None
+        if not self.hat_path or not self.sprite_width or not self.sprite_height:
+            return
+        try:
+            with Image.open(self.hat_path) as image:
+                hat = image.convert("RGBA")
+                bounds = hat.getchannel("A").getbbox()
+                if bounds:
+                    hat = hat.crop(bounds)
+                scale = HAT_ART_SCALE * (self.scale_factor / HAT_REFERENCE_SCALE)
+                new_size = (
+                    max(1, round(hat.width * scale)),
+                    max(1, round(hat.height * scale)),
+                )
+                self.hat_image = hat.resize(new_size, Image.Resampling.LANCZOS)
+            self.display_hat_image = (
+                ImageOps.mirror(self.hat_image) if self.cat_flipped else self.hat_image
+            )
+        except OSError:
+            self.hat_path = None
+
+    # ------------------------------------------------------------------
+    # Layered Overlay (Windows)
+    # ------------------------------------------------------------------
+    def create_sprite_overlay(self):
+        self.layered_api = ctypes.WinDLL("user32", use_last_error=True)
+        self.gdi_api = ctypes.WinDLL("gdi32", use_last_error=True)
+        self.sprite_overlay = tk.Toplevel(self.root)
+        self.sprite_overlay.overrideredirect(True)
+        self.sprite_overlay.attributes("-topmost", True)
+        self.sprite_overlay.geometry(f"{self.width}x{self.height}+100+100")
+        self.sprite_overlay.update_idletasks()
+        self.sprite_overlay.bind("<Button-1>", self.on_sprite_click)
+        self.sprite_overlay.bind("<ButtonRelease-1>", self.finish_drag)
+        self.sprite_overlay.bind("<Button-3>", self.toggle_ghost_mode)
+        self.sprite_overlay.bind("<B1-Motion>", self.do_drag)
+
+        hwnd = self.sprite_overlay.winfo_id()
+        self.layered_api.GetAncestor.argtypes = [ctypes.c_void_p, wintypes.UINT]
+        self.layered_api.GetAncestor.restype = ctypes.c_void_p
+        hwnd = self.layered_api.GetAncestor(hwnd, 2) or hwnd
+        self.overlay_hwnd = hwnd
+        root_hwnd = self.layered_api.GetAncestor(self.root.winfo_id(), 2)
+        self.root_hwnd = root_hwnd or self.root.winfo_id()
+
+        get_style = getattr(
+            self.layered_api, "GetWindowLongPtrW", self.layered_api.GetWindowLongW
+        )
+        set_style = getattr(
+            self.layered_api, "SetWindowLongPtrW", self.layered_api.SetWindowLongW
+        )
+        get_style.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        get_style.restype = ctypes.c_ssize_t
+        set_style.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+        set_style.restype = ctypes.c_ssize_t
+        ex_style = get_style(hwnd, -20)
+        ex_style |= 0x00080000 | 0x08000000 | 0x00000080
+        set_style(hwnd, -20, ex_style)
+        self.overlay_get_style = get_style
+        self.overlay_set_style = set_style
+
+        self.layered_api.GetDC.argtypes = [ctypes.c_void_p]
+        self.layered_api.GetDC.restype = ctypes.c_void_p
+        self.layered_api.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.layered_api.ReleaseDC.restype = ctypes.c_int
+        self.layered_api.UpdateLayeredWindow.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(WinPoint),
+            ctypes.POINTER(WinSize),
+            ctypes.c_void_p,
+            ctypes.POINTER(WinPoint),
+            wintypes.DWORD,
+            ctypes.POINTER(BlendFunction),
+            wintypes.DWORD,
+        ]
+        self.layered_api.UpdateLayeredWindow.restype = wintypes.BOOL
+        self.layered_api.SetWindowPos.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        self.layered_api.SetWindowPos.restype = wintypes.BOOL
+
+        self.gdi_api.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+        self.gdi_api.CreateCompatibleDC.restype = ctypes.c_void_p
+        self.gdi_api.DeleteDC.argtypes = [ctypes.c_void_p]
+        self.gdi_api.DeleteDC.restype = wintypes.BOOL
+        self.gdi_api.CreateDIBSection.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(BitmapInfo),
+            wintypes.UINT,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        self.gdi_api.CreateDIBSection.restype = ctypes.c_void_p
+        self.gdi_api.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.gdi_api.SelectObject.restype = ctypes.c_void_p
+        self.gdi_api.DeleteObject.argtypes = [ctypes.c_void_p]
+        self.gdi_api.DeleteObject.restype = wintypes.BOOL
+
+        self.sprite_overlay.deiconify()
+
+    def render_sprite_overlay(self, sprite):
+        width, height = self.width, self.height
+        physical_size = (height, width) if self.cat_rotation % 2 else (width, height)
+        overlay_width = physical_size[0]
+        self.overlay_horizontal_padding = 0
+        self.overlay_render_width = overlay_width
+        overlay_size = (overlay_width, physical_size[1] + self.HEART_TOP_PADDING)
+        position = (
+            self.root.winfo_rootx() - self.overlay_horizontal_padding,
+            self.root.winfo_rooty() - self.HEART_TOP_PADDING,
+        )
+        if position != self.last_overlay_position:
+            self.layered_api.SetWindowPos(
+                self.overlay_hwnd,
+                ctypes.c_void_p(-1),
+                *position,
+                *overlay_size,
+                0x0040 | 0x0010 | 0x0200,
+            )
+            self.last_overlay_position = position
+
+        sprite_key = id(sprite) if sprite is not None else None
+        has_hearts = bool(self.floating_hearts)
+        bar_key = self.bar_text
+        if (
+            not has_hearts
+            and not self.last_overlay_had_hearts
+            and sprite_key == self.last_overlay_sprite
+            and overlay_size == self.last_overlay_size
+            and self.is_ghost == self.last_overlay_ghost
+            and bar_key == self.last_overlay_bar_text
+            and self.love_animation_until <= time.monotonic()
+        ):
+            return
+
+        frame = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(frame)
+
+        # Zählerleiste (ohne Menü-Quadrat) – Breite passt sich dem Text an
+        if self.bar_text:
+            if self.bar_text != self._bar_text_cache:
+                probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+                self._bar_text_width = probe.textbbox(
+                    (0, 0), self.bar_text, font=self._counter_font
+                )[2]
+                self._bar_text_cache = self.bar_text
+            bar_y, bar_bottom = height - 28, height - 4
+            pad = 12
+            bar_right = max(width - 7, 7 + self._bar_text_width + pad * 2)
+            # Fensterbreite anpassen, falls Text länger ist als Sprite
+            needed = bar_right + 7
+            if needed > width:
+                self.width = needed
+                width = needed
+                self.canvas.config(width=self.width)
+                self.root.geometry(f"{self.width}x{self.height}")
+                frame = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(frame)
+                bar_right = width - 7
+            draw.rectangle(
+                (7, bar_y, bar_right, bar_bottom),
+                fill=self.bar_accent_color,
+                outline="#000000",
+            )
+            draw.text(
+                (7 + pad, bar_y + 4),
+                self.bar_text,
+                fill="#000000",
+                font=self._counter_font,
+            )
+
+        if sprite is not None:
+            x = (width - sprite.width) // 2 + self.sprite_horizontal_offset()
+            y = height - self.sprite_bottom_gap() - sprite.height
+            frame.alpha_composite(sprite, (x, y))
+            if self.display_hat_image is not None:
+                hat_x = (
+                    x
+                    + (sprite.width - self.display_hat_image.width) // 2
+                    - self.sprite_horizontal_offset()
+                )
+                hat_y = (
+                    y
+                    + int(sprite.height * 0.12)
+                    - self.display_hat_image.height // 2
+                    + max(1, round(sprite.height * 0.28))
+                )
+                if self.cat_flipped:
+                    hat_x += round(sprite.width * 0.10)
+                frame.alpha_composite(self.display_hat_image, (hat_x, hat_y))
+
+        now = time.monotonic()
+        self.floating_hearts[:] = [
+            heart
+            for heart in self.floating_hearts
+            if now - heart[0] < self.heart_travel_time(heart[2])
+        ]
+
+        if self.cat_rotation:
+            frame = frame.rotate(-90 * self.cat_rotation, expand=True)
+        rotated_frame = frame
+        frame = Image.new("RGBA", overlay_size, (0, 0, 0, 0))
+        frame.alpha_composite(
+            rotated_frame, (self.overlay_horizontal_padding, self.HEART_TOP_PADDING)
+        )
+        if physical_size != (self.root.winfo_width(), self.root.winfo_height()):
+            self.root.geometry(f"{physical_size[0]}x{physical_size[1]}")
+            self.canvas.config(width=physical_size[0], height=physical_size[1])
+
+        for started, heart_x, start_y in self.floating_hearts:
+            age = now - started
+            travel_time = self.heart_travel_time(start_y)
+            progress = min(1.0, age / travel_time)
+            eased = 1 - (1 - progress) ** 2
+            if self.cat_rotation == 1:
+                screen_x, screen_y = height - 1 - start_y, heart_x
+            elif self.cat_rotation == 2:
+                screen_x, screen_y = width - 1 - heart_x, height - 1 - start_y
+            elif self.cat_rotation == 3:
+                screen_x, screen_y = start_y, width - 1 - heart_x
+            else:
+                screen_x, screen_y = heart_x, start_y
+            screen_x += self.overlay_horizontal_padding
+            heart_y = self.HEART_TOP_PADDING + screen_y - int(
+                self.HEART_RISE_DISTANCE * eased
+            )
+            fade_duration = min(1.5, travel_time)
+            fade = min(
+                1.0, max(0.0, (age - travel_time + fade_duration) / fade_duration)
+            )
+            heart = self.heart_base_image.copy()
+            alpha = heart.getchannel("A")
+            alpha = alpha.point(lambda value: round(value * (1.0 - fade)))
+            heart.putalpha(alpha)
+            frame.alpha_composite(
+                heart,
+                (int(screen_x - heart.width / 2), int(heart_y - heart.height / 2)),
+            )
+
+        # Premultiplied BGRA für UpdateLayeredWindow
+        red, green, blue, alpha = frame.split()
+        red = ImageChops.multiply(red, alpha)
+        green = ImageChops.multiply(green, alpha)
+        blue = ImageChops.multiply(blue, alpha)
+        bgra = Image.merge("RGBA", (blue, green, red, alpha)).tobytes()
+
+        fw, fh = frame.size
+        info = BitmapInfo()
+        info.bmiHeader = BitmapInfoHeader(
+            ctypes.sizeof(BitmapInfoHeader),
+            fw,
+            -fh,
+            1,
+            32,
+            0,
+            fw * fh * 4,
+            0,
+            0,
+            0,
+            0,
+        )
+        screen_dc = self.layered_api.GetDC(None)
+        memory_dc = self.gdi_api.CreateCompatibleDC(screen_dc)
+        bits = ctypes.c_void_p()
+        bitmap = self.gdi_api.CreateDIBSection(
+            screen_dc, ctypes.byref(info), 0, ctypes.byref(bits), None, 0
+        )
+        if not bitmap or not bits:
+            self.gdi_api.DeleteDC(memory_dc)
+            self.layered_api.ReleaseDC(None, screen_dc)
+            return
+
+        old_bitmap = self.gdi_api.SelectObject(memory_dc, bitmap)
+        ctypes.memmove(bits, bgra, len(bgra))
+        destination = WinPoint(
+            self.root.winfo_rootx() - self.overlay_horizontal_padding,
+            self.root.winfo_rooty() - self.HEART_TOP_PADDING,
+        )
+        source = WinPoint(0, 0)
+        size = WinSize(frame.width, frame.height)
+        blend = BlendFunction(0, 0, 90 if self.is_ghost else 255, 1)
+        updated = self.layered_api.UpdateLayeredWindow(
+            self.overlay_hwnd,
+            screen_dc,
+            ctypes.byref(destination),
+            ctypes.byref(size),
+            memory_dc,
+            ctypes.byref(source),
+            0,
+            ctypes.byref(blend),
+            2,
+        )
+        self.layered_api.SetWindowPos(
+            self.overlay_hwnd,
+            ctypes.c_void_p(-1),
+            destination.x,
+            destination.y,
+            frame.width,
+            frame.height,
+            0x0040 | 0x0010 | 0x0200,
+        )
+        self.gdi_api.SelectObject(memory_dc, old_bitmap)
+        self.gdi_api.DeleteObject(bitmap)
+        self.gdi_api.DeleteDC(memory_dc)
+        self.layered_api.ReleaseDC(None, screen_dc)
+        if not updated and not self.overlay_error_shown:
+            print(
+                f"Sprite-Ebene konnte nicht aktualisiert werden "
+                f"(Windows-Fehler {ctypes.get_last_error()})."
+            )
+            self.overlay_error_shown = True
+        self.last_overlay_sprite = sprite_key
+        self.last_overlay_size = overlay_size
+        self.last_overlay_ghost = self.is_ghost
+        self.last_overlay_had_hearts = has_hearts
+        self.last_overlay_bar_text = bar_key
+
+    # ------------------------------------------------------------------
+    # F / R per Polling (kein WH_KEYBOARD_LL → kein GIL-Crash)
+    # ------------------------------------------------------------------
+    def poll_hotkeys(self):
+        """F = spiegeln, R = drehen – nur wenn Maus über der Katze."""
+        if not self.user32:
+            return
+        # VK_F = 0x46, VK_R = 0x52; high bit gesetzt = Taste gedrückt
+        f_down = bool(self.user32.GetAsyncKeyState(0x46) & 0x8000)
+        r_down = bool(self.user32.GetAsyncKeyState(0x52) & 0x8000)
+        if f_down and not self._prev_f_down:
+            self.pending_cat_transforms.append(0x46)
+        if r_down and not self._prev_r_down:
+            self.pending_cat_transforms.append(0x52)
+        self._prev_f_down = f_down
+        self._prev_r_down = r_down
+
+    def get_paw_state(self):
+        return self.paw_state
+
+    def transformed_sprite(self, sprite):
+        key = (id(sprite), self.cat_flipped)
+        if key not in self.sprite_transform_cache:
+            self.sprite_transform_cache[key] = (
+                ImageOps.mirror(sprite) if self.cat_flipped else sprite
+            )
+        return self.sprite_transform_cache[key]
+
+    def cursor_is_over_cat(self):
+        if not self.has_images or not self.user32:
+            return False
+        point = WinPoint()
+        if not self.user32.GetCursorPos(ctypes.byref(point)):
+            return False
+        state = self.get_paw_state()
+        idx = {"idle": 0, "left": 1, "right": 2, "both": 3}[state]
+        sprite = self.transformed_sprite(self.sprite_frames[idx])
+        x, y = self.screen_to_logical(
+            point.x - self.root.winfo_rootx(), point.y - self.root.winfo_rooty()
+        )
+        left = (self.width - sprite.width) // 2 + self.sprite_horizontal_offset()
+        top = self.height - self.sprite_bottom_gap() - sprite.height
+        x, y = x - left, y - top
+        return (
+            0 <= x < sprite.width
+            and 0 <= y < sprite.height
+            and sprite.getpixel((int(x), int(y)))[3] > 32
+        )
+
+    def transform_cat_if_hovered(self, vk):
+        if not self.cursor_is_over_cat():
+            return
+        if vk == 0x46:  # F – spiegeln
+            self.cat_flipped = not self.cat_flipped
+            self.sprite_transform_cache.clear()
+            self.display_hat_image = (
+                ImageOps.mirror(self.hat_image)
+                if self.hat_image and self.cat_flipped
+                else self.hat_image
+            )
+        else:  # R – drehen
+            pointer = WinPoint()
+            self.user32.GetCursorPos(ctypes.byref(pointer))
+            canonical_x, canonical_y = self.screen_to_logical(
+                pointer.x - self.root.winfo_rootx(),
+                pointer.y - self.root.winfo_rooty(),
+            )
+            self.cat_rotation = (self.cat_rotation + 1) % 4
+            if self.cat_rotation == 1:
+                rotated_x, rotated_y = self.height - 1 - canonical_y, canonical_x
+            elif self.cat_rotation == 2:
+                rotated_x, rotated_y = (
+                    self.width - 1 - canonical_x,
+                    self.height - 1 - canonical_y,
+                )
+            elif self.cat_rotation == 3:
+                rotated_x, rotated_y = canonical_y, self.width - 1 - canonical_x
+            else:
+                rotated_x, rotated_y = canonical_x, canonical_y
+            new_width, new_height = (
+                (self.height, self.width)
+                if self.cat_rotation % 2
+                else (self.width, self.height)
+            )
+            window_x = pointer.x - rotated_x
+            window_y = pointer.y - rotated_y
+            self.window_x, self.window_y = window_x, window_y
+            self.root.geometry(f"{new_width}x{new_height}+{window_x}+{window_y}")
+            self.last_overlay_position = None
+        self.update_display()
+
+    def screen_to_logical(self, x, y):
+        if self.cat_rotation == 1:
+            return y, self.height - 1 - x
+        if self.cat_rotation == 2:
+            return self.width - 1 - x, self.height - 1 - y
+        if self.cat_rotation == 3:
+            return self.width - 1 - y, x
+        return x, y
+
+    def sprite_bottom_gap(self):
+        if not self.bar_text:
+            return max(0, round((0.55 - self.scale_factor) * 20))
+        return max(0, round((0.55 - self.scale_factor) * 40))
+
+    def sprite_horizontal_offset(self):
+        return max(1, round(self.sprite_width * 0.02))
+
+    def update_display(self):
+        # Breite ggf. an Bar-Text anpassen
+        if self.bar_text:
+            if self.bar_text != self._bar_text_cache:
+                probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+                self._bar_text_width = probe.textbbox(
+                    (0, 0), self.bar_text, font=self._counter_font
+                )[2]
+                self._bar_text_cache = self.bar_text
+            required = self._bar_text_width + 30
+            if required > self.width:
+                self.width = required
+                self.canvas.config(width=self.width)
+                self.root.geometry(f"{self.width}x{self.height}")
+
+        self.canvas.delete("all")
+        image = None
+        if self.has_images:
+            state = self.get_paw_state()
+            idx = {"idle": 0, "left": 1, "right": 2, "both": 3}[state]
+            image = self.transformed_sprite(self.sprite_frames[idx])
+        self.render_sprite_overlay(image)
+        if self.refresh_job is None:
+            self.refresh_job = self.root.after(40, self.refresh_if_needed)
+
+    def on_sprite_click(self, event):
+        if event.y < self.HEART_TOP_PADDING:
+            return "break"
+        event_y = event.y - self.HEART_TOP_PADDING
+        x, y = self.screen_to_logical(
+            event.x - self.overlay_horizontal_padding, event_y
+        )
+        sprite = self.sprite_frames[0] if self.has_images else None
+        if sprite is not None:
+            sprite_x = (self.width - sprite.width) // 2 + self.sprite_horizontal_offset()
+            sprite_y = self.height - self.sprite_bottom_gap() - sprite.height
+            if (
+                sprite_x <= x <= sprite_x + sprite.width
+                and sprite_y <= y <= sprite_y + sprite.height
+            ):
+                self.start_drag(event)
+        return "break"
+
+    @staticmethod
+    def heart_travel_time(start_y):
+        return 1.1
+
+    def make_heart_image(self):
+        emoji = self.emoji
+        font_path = r"C:\Windows\Fonts\seguiemj.ttf"
+        try:
+            font = ImageFont.truetype(font_path, 48)
+        except OSError:
+            try:
+                font = ImageFont.truetype(r"C:\Windows\Fonts\seguisym.ttf", 48)
+            except OSError:
+                font = ImageFont.load_default()
+        image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        try:
+            draw.text((4, 2), emoji, font=font, embedded_color=True)
+        except TypeError:
+            draw.text((4, 2), emoji, font=font, fill="#ff5c86")
+        bounds = image.getbbox()
+        if bounds:
+            image = image.crop(bounds)
+        width, height = image.size
+        scale = min(30 / width, 30 / height)
+        resized = image.resize(
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+        square = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
+        square.alpha_composite(
+            resized, ((32 - resized.width) // 2, (32 - resized.height) // 2)
+        )
+        return square
+
+    def refresh_if_needed(self):
+        self.refresh_job = None
+        self.poll_hotkeys()
+        pending, self.pending_cat_transforms = self.pending_cat_transforms, []
+        for vk in pending:
+            self.transform_cat_if_hovered(vk)
+        self.update_display()
+
+    def start_drag(self, event):
+        self.drag_start_pointer = (event.x_root, event.y_root)
+        self.drag_window_position = (self.window_x, self.window_y)
+        event_y = event.y - (
+            self.HEART_TOP_PADDING if event.widget is self.sprite_overlay else 0
+        )
+        event_x, event_y = self.screen_to_logical(event.x, event_y)
+        on_cat = False
+        if self.has_images and (
+            not self.bar_text or event_y < self.height - 28
+        ):
+            state = self.get_paw_state()
+            idx = {"idle": 0, "left": 1, "right": 2, "both": 3}[state]
+            sprite = self.transformed_sprite(self.sprite_frames[idx])
+            sprite_left = (self.width - sprite.width) // 2 + self.sprite_horizontal_offset()
+            sprite_top = self.height - self.sprite_bottom_gap() - sprite.height
+            pixel_x, pixel_y = event_x - sprite_left, event_y - sprite_top
+            if 0 <= pixel_x < sprite.width and 0 <= pixel_y < sprite.height:
+                on_cat = sprite.getpixel((int(pixel_x), int(pixel_y)))[3] > 32
+        self.drag_on_cat = on_cat
+        self.drag_has_moved = False
+
+    def finish_drag(self, event=None):
+        if getattr(self, "drag_on_cat", False) and not getattr(
+            self, "drag_has_moved", False
+        ):
+            self.play_cat_tap()
+        self.drag_on_cat = False
+
+    def play_cat_tap(self):
+        self.love_animation_until = time.monotonic() + 1.8
+        center_x = self.width // 2
+        center_y = self.height - self.sprite_bottom_gap() - self.sprite_height / 2
+        min_x = max(16, center_x - int(self.sprite_width * 0.45))
+        max_x = min(self.width - 16, center_x + int(self.sprite_width * 0.45))
+        min_y = max(28, center_y - int(self.sprite_height * 0.28))
+        max_y = min(self.height - 42, center_y + int(self.sprite_height * 0.28))
+        active_positions = []
+        now = time.monotonic()
+        for started, old_x, old_y in self.floating_hearts:
+            age = now - started
+            if age < self.heart_travel_time(old_y):
+                old_progress = min(1.0, age / self.heart_travel_time(old_y))
+                old_y_now = old_y - (old_y - 20) * (1 - (1 - old_progress) ** 2)
+                active_positions.append((old_x, old_y_now))
+        candidates = []
+        import random
+
+        for _ in range(100):
+            candidate = (
+                random.uniform(min_x, max_x),
+                random.uniform(min_y, max_y),
+            )
+            spacing = min(
+                (math.dist(candidate, position) for position in active_positions),
+                default=1000,
+            )
+            candidates.append((spacing, candidate))
+            if spacing >= 46:
+                break
+        _, (heart_x, heart_y) = max(candidates, key=lambda item: item[0])
+        self.floating_hearts.append((now, heart_x, heart_y))
+
+    def do_drag(self, event):
+        if (
+            abs(event.x_root - self.drag_start_pointer[0]) > 4
+            or abs(event.y_root - self.drag_start_pointer[1]) > 4
+        ):
+            self.drag_has_moved = True
+        if not self.is_ghost:
+            new_x = (
+                self.drag_window_position[0]
+                + event.x_root
+                - self.drag_start_pointer[0]
+            )
+            new_y = (
+                self.drag_window_position[1]
+                + event.y_root
+                - self.drag_start_pointer[1]
+            )
+            self.window_x, self.window_y = new_x, new_y
+            self.root.geometry(f"+{new_x}+{new_y}")
+            overlay_height = self.width if self.cat_rotation % 2 else self.height
+            self.layered_api.SetWindowPos(
+                self.overlay_hwnd,
+                ctypes.c_void_p(-1),
+                new_x - self.overlay_horizontal_padding,
+                new_y - self.HEART_TOP_PADDING,
+                self.overlay_render_width,
+                overlay_height + self.HEART_TOP_PADDING,
+                0x0040 | 0x0010 | 0x0200,
+            )
+            self.last_overlay_position = (
+                new_x - self.overlay_horizontal_padding,
+                new_y - self.HEART_TOP_PADDING,
+            )
+
+    def toggle_ghost_mode(self, event=None):
+        if not self.is_ghost:
+            self.is_ghost = True
+            self.root.attributes("-alpha", 0.35)
+            self.set_click_through(True)
+            self.root.after(4000, self.reset_ghost_mode)
+
+    def reset_ghost_mode(self):
+        self.set_click_through(False)
+        self.root.attributes("-alpha", 1.0)
+        self.is_ghost = False
+
+    def set_click_through(self, enable):
+        try:
+            ex_style = self.overlay_get_style(self.root_hwnd, -20)
+            if enable:
+                ex_style |= 0x00080020
+            else:
+                ex_style &= ~0x00000020
+            self.overlay_set_style(self.root_hwnd, -20, ex_style)
+            overlay_style = self.overlay_get_style(self.overlay_hwnd, -20)
+            if enable:
+                overlay_style |= 0x00000020
+            else:
+                overlay_style &= ~0x00000020
+            self.overlay_set_style(self.overlay_hwnd, -20, overlay_style)
+        except Exception:
+            pass
+
+    def close(self):
+        self.running = False
+        self.root.destroy()
 
 if __name__ == "__main__":
     try:
@@ -2017,5 +3443,5 @@ if __name__ == "__main__":
     except (OSError, subprocess.SubprocessError) as error:
         print(f"Desktop-Verknüpfung konnte nicht erstellt werden: {error}")
     root = tk.Tk()
-    app = BongoCatPro(root)
+    PerformoCatApp = PerformoCat(root)
     root.mainloop()
